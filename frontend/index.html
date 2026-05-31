@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deepseek Chat</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header>
+      <h1>Deepseek 调用页面</h1>
+    </header>
+
+    <section class="panel" id="conversation-panel">
+      <div class="toolbar">
+        <button id="new-conversation">新建对话</button>
+        <select id="conversation-select"></select>
+      </div>
+      <div class="conversation-window" id="conversation-window"></div>
+    </section>
+
+    <section class="panel" id="input-panel">
+      <div class="status-bar" id="request-status">准备就绪</div>
+      <textarea id="message-input" placeholder="请输入您的问题..."></textarea>
+      <button id="send-button">发送</button>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
