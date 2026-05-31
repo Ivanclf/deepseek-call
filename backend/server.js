@@ -29,8 +29,20 @@ function getConversationPath(conversationId) {
 function listConversations() {
   return fs.readdirSync(HISTORY_DIR)
     .filter((file) => file.endsWith('.json'))
-    .map((file) => path.basename(file, '.json'))
-    .sort((a, b) => b.localeCompare(a));
+    .map((file) => {
+      const filePath = path.join(HISTORY_DIR, file);
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const conversation = JSON.parse(raw);
+      const lastMessage = conversation.messages.length > 0 
+        ? conversation.messages[conversation.messages.length - 1].content 
+        : '';
+      return {
+        id: path.basename(file, '.json'),
+        lastMessage: lastMessage.substring(0, 50) + (lastMessage.length > 50 ? '...' : ''),
+        timestamp: conversation.updatedAt || conversation.createdAt
+      };
+    })
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
 function loadConversation(conversationId) {
@@ -45,6 +57,7 @@ function loadConversation(conversationId) {
 
 function saveConversation(conversation) {
   const filePath = getConversationPath(conversation.conversationId);
+  conversation.updatedAt = new Date().toISOString();
   fs.writeFileSync(filePath, JSON.stringify(conversation, null, 2), 'utf8');
 }
 
@@ -54,6 +67,7 @@ function createConversation() {
   const conversation = {
     conversationId,
     createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     messages: []
   };
   saveConversation(conversation);
@@ -84,6 +98,36 @@ app.get('/api/conversations/:conversationId', (req, res) => {
   res.json({ conversationId: conversation.conversationId, messages: conversation.messages });
 });
 
+app.delete('/api/conversations/:conversationId', (req, res) => {
+  const { conversationId } = req.params;
+  const filePath = getConversationPath(conversationId);
+  if (!fs.existsSync(filePath)) {
+    res.status(404).json({ error: 'Conversation not found' });
+    return;
+  }
+  fs.unlinkSync(filePath);
+  res.json({ success: true });
+});
+
+app.delete('/api/conversations/:conversationId/last-messages', (req, res) => {
+  const { conversationId } = req.params;
+  const conversation = loadConversation(conversationId);
+  if (!conversation) {
+    res.status(404).json({ error: 'Conversation not found' });
+    return;
+  }
+
+  if (conversation.messages.length < 2) {
+    res.status(400).json({ error: 'Not enough messages to delete' });
+    return;
+  }
+
+  conversation.messages.pop();
+  conversation.messages.pop();
+  saveConversation(conversation);
+  res.json({ success: true, messages: conversation.messages });
+});
+
 function buildDeepseekRequest(conversationId, messages) {
   const systemMessage = {
     role: 'system',
@@ -94,12 +138,18 @@ function buildDeepseekRequest(conversationId, messages) {
     messages: [systemMessage, ...messages],
     thinking: { type: 'enabled' },
     reasoning_effort: 'high',
-    stream: false
+    stream: true
   };
 }
 
-function streamTextChunks(res, text, prefix = '') {
-  const chunks = text.match(/.{1,100}/g) || [text];
+function streamJsonEvent(res, event) {
+  const serialized = JSON.stringify(event);
+  res.write(`${serialized}\n`);
+}
+
+function streamTextChunks(res, text, eventType) {
+  if (!text) return Promise.resolve();
+  const chunks = text.match(/.{1,50}/g) || [text];
   let index = 0;
   return new Promise((resolve) => {
     const interval = setInterval(() => {
@@ -108,61 +158,10 @@ function streamTextChunks(res, text, prefix = '') {
         resolve();
         return;
       }
-      const output = index === 0 ? prefix + chunks[index] : chunks[index];
-      res.write(output);
+      streamJsonEvent(res, { type: eventType, text: chunks[index] });
       index += 1;
-    }, 200);
+    }, 30);
   });
-}
-
-function streamThinkingSteps(res, steps) {
-  if (!steps || !steps.length) {
-    return Promise.resolve();
-  }
-  const thinkingText = steps.map((step) => `思考过程：${step}\n`).join('');
-  return streamTextChunks(res, thinkingText);
-}
-
-function simulateDeepseekStream(requestBody, res) {
-  const historyCount = requestBody.messages.length;
-  const thinkingSteps = [
-    `收到历史消息 ${historyCount} 条，正在进行深度思考...`,
-    '正在提取核心信息，并生成回答。',
-    '整理回答结构：引导、说明、示例...'
-  ];
-  const answer = 'Deepseek 模拟响应：这是你当前问题的分析结果。';
-
-  return new Promise(async (resolve) => {
-    await streamThinkingSteps(res, thinkingSteps);
-    await streamTextChunks(res, answer, '回答：');
-    resolve(`${thinkingSteps.join(' ')} ${answer}`);
-  });
-}
-
-function extractDeepseekText(responseJson) {
-  if (!responseJson) return '';
-  if (responseJson.error) {
-    throw new Error(responseJson.error.message || JSON.stringify(responseJson.error));
-  }
-
-  if (responseJson.choices && responseJson.choices.length > 0) {
-    const choice = responseJson.choices[0];
-    if (choice.message && typeof choice.message.content === 'string') {
-      return choice.message.content;
-    }
-    if (typeof choice.text === 'string') {
-      return choice.text;
-    }
-    if (choice.delta && typeof choice.delta.content === 'string') {
-      return choice.delta.content;
-    }
-  }
-
-  if (typeof responseJson.content === 'string') {
-    return responseJson.content;
-  }
-
-  return '';
 }
 
 async function streamRemoteDeepseekResponse(requestBody, res) {
@@ -173,13 +172,6 @@ async function streamRemoteDeepseekResponse(requestBody, res) {
     throw new Error('Missing DEEPSEEK_API_URL environment variable');
   }
 
-  const thinkingSteps = [
-    'Deepseek 正在进行深度思考...',
-    '分析问题背景和语境...',
-    '生成回答结构与关键点...'
-  ];
-  await streamThinkingSteps(res, thinkingSteps);
-
   const response = await fetch(DEEPSEEK_API_URL, {
     method: 'POST',
     headers: {
@@ -189,25 +181,108 @@ async function streamRemoteDeepseekResponse(requestBody, res) {
     body: JSON.stringify(requestBody)
   });
 
-  const responseBody = await response.text();
-  let parsed;
-  try {
-    parsed = JSON.parse(responseBody);
-  } catch (err) {
-    throw new Error(`Deepseek API returned non-JSON response: ${responseBody}`);
-  }
-
   if (!response.ok) {
-    throw new Error(`Deepseek API error ${response.status}: ${parsed.error?.message || responseBody}`);
+    const errorBody = await response.text();
+    throw new Error(`Deepseek API error ${response.status}: ${errorBody}`);
   }
 
-  const assistantText = extractDeepseekText(parsed);
-  if (!assistantText) {
-    throw new Error('Deepseek response did not include assistant content');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let reasoningContent = '';
+  let answerContent = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      if (line === 'data: [DONE]') continue;
+
+      let data;
+      try {
+        if (line.startsWith('data: ')) {
+          data = JSON.parse(line.slice(6));
+        } else {
+          data = JSON.parse(line);
+        }
+      } catch (e) {
+        continue;
+      }
+
+      if (data.type === 'reasoning') {
+        const text = data.delta || data.text || '';
+        reasoningContent += text;
+        await streamTextChunks(res, text, 'reasoning');
+      } else if (data.type === 'message') {
+        const text = data.delta?.content || data.content || '';
+        answerContent += text;
+        await streamTextChunks(res, text, 'answer');
+      } else if (data.choices && data.choices.length > 0) {
+        const choice = data.choices[0];
+        if (choice.delta) {
+          if (choice.delta.reasoning_content) {
+            reasoningContent += choice.delta.reasoning_content;
+            await streamTextChunks(res, choice.delta.reasoning_content, 'reasoning');
+          }
+          if (choice.delta.content) {
+            answerContent += choice.delta.content;
+            await streamTextChunks(res, choice.delta.content, 'answer');
+          }
+        }
+      }
+    }
   }
 
-  await streamTextChunks(res, assistantText, '回答：');
-  return assistantText;
+  if (buffer.trim()) {
+    try {
+      let data;
+      if (buffer.startsWith('data: ')) {
+        data = JSON.parse(buffer.slice(6));
+      } else {
+        data = JSON.parse(buffer);
+      }
+      if (data.choices && data.choices.length > 0) {
+        const choice = data.choices[0];
+        if (choice.delta?.reasoning_content) {
+          reasoningContent += choice.delta.reasoning_content;
+          await streamTextChunks(res, choice.delta.reasoning_content, 'reasoning');
+        }
+        if (choice.delta?.content) {
+          answerContent += choice.delta.content;
+          await streamTextChunks(res, choice.delta.content, 'answer');
+        }
+      }
+    } catch (e) {
+    }
+  }
+
+  return { reasoningContent, answerContent };
+}
+
+function simulateDeepseekStream(requestBody, res) {
+  const historyCount = requestBody.messages.length;
+  const thinkingSteps = [
+    `收到历史消息 ${historyCount} 条，正在分析上下文...`,
+    '正在检索相关知识...',
+    '正在构建回答框架...',
+    '正在优化回答内容...'
+  ];
+  const answer = '这是模拟的 Deepseek 响应。在实际使用中，这里会显示真实的 AI 回答。';
+
+  return new Promise(async (resolve) => {
+    for (const step of thinkingSteps) {
+      await streamTextChunks(res, step + '\n\n', 'reasoning');
+      await new Promise(r => setTimeout(r, 300));
+    }
+    await streamTextChunks(res, answer, 'answer');
+    resolve(answer);
+  });
 }
 
 function appendMessage(conversation, message) {
@@ -229,6 +304,7 @@ app.post('/api/conversations/:conversationId/stream', async (req, res) => {
     conversation = {
       conversationId,
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       messages: []
     };
     saveConversation(conversation);
@@ -243,22 +319,26 @@ app.post('/api/conversations/:conversationId/stream', async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.flushHeaders();
 
-  let assistantText = '';
+  let reasoningContent = '';
+  let answerContent = '';
   try {
     if (DEEPSEEK_API_URL && DEEPSEEK_API_KEY) {
-      assistantText = await streamRemoteDeepseekResponse(requestBody, res);
+      const result = await streamRemoteDeepseekResponse(requestBody, res);
+      reasoningContent = result.reasoningContent;
+      answerContent = result.answerContent;
     } else {
-      assistantText = await simulateDeepseekStream(requestBody, res);
+      answerContent = await simulateDeepseekStream(requestBody, res);
     }
   } catch (error) {
-    res.write(`Deepseek 服务错误：${error.message}`);
+    res.write(`{"type":"error","message":"${error.message}"}`);
     res.end();
     return;
   }
 
   const assistantMessage = {
     role: 'assistant',
-    content: assistantText,
+    reasoning: reasoningContent,
+    content: answerContent,
     timestamp: new Date().toISOString()
   };
   appendMessage(conversation, assistantMessage);
